@@ -2,6 +2,7 @@ use std::{borrow::Cow, io::Write};
 
 use anyhow::Result;
 use byteorder::{BE, WriteBytesExt};
+use either::Either;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use turbo_rcstr::RcStr;
@@ -12,12 +13,14 @@ use turbo_tasks_fs::{
     File, FileContent, FileSystemPath,
     rope::{Rope, RopeBuilder},
 };
-use turbopack_analyze::split_chunk::split_output_asset_into_parts;
+use turbopack_analyze::split_chunk::{
+    split_output_asset_into_parts, split_traced_module_into_parts,
+};
 use turbopack_core::{
     SOURCE_URL_PROTOCOL,
     asset::{Asset, AssetContent},
     chunk::{ChunkingType, TracedMode},
-    module::Module,
+    module::{Module, Modules},
     module_graph::{GraphTraversalAction, ModuleGraph},
     output::{OutputAsset, OutputAssets, OutputAssetsReference},
     reference::all_assets_from_entries,
@@ -387,8 +390,23 @@ pub async fn combine_output_assets(
     Ok(Vc::cell(combined))
 }
 
+/// Merges two sets of traced modules into one. Used to combine per-route traced
+/// modules with shared modules (e.g. `_app`, `_document`) at report generation time.
 #[turbo_tasks::function]
-pub async fn analyze_output_assets(output_assets: Vc<OutputAssets>) -> Result<Vc<FileContent>> {
+pub async fn combine_traced_modules(
+    primary: Vc<Modules>,
+    extra: Vc<Modules>,
+) -> Result<Vc<Modules>> {
+    let mut combined: Vec<ResolvedVc<Box<dyn Module>>> = primary.await?.iter().copied().collect();
+    combined.extend(extra.await?.iter().copied());
+    Ok(Vc::cell(combined))
+}
+
+#[turbo_tasks::function]
+pub async fn analyze_output_assets(
+    output_assets: Vc<OutputAssets>,
+    traced_modules: Vc<Modules>,
+) -> Result<Vc<FileContent>> {
     let output_assets = all_assets_from_entries(output_assets);
 
     let mut builder = AnalyzeDataBuilder::new();
@@ -397,15 +415,29 @@ pub async fn analyze_output_assets(output_assets: Vc<OutputAssets>) -> Result<Vc
 
     // Process the output assets and extract chunk parts.
     // Also creates sources for the chunk parts.
-    for asset in output_assets.await? {
-        let filename = asset.path().to_string().owned().await?;
-        if filename.ends_with(".map") || filename.ends_with(".nft.json") {
+    for asset in output_assets
+        .await?
+        .iter()
+        .copied()
+        .map(Either::Left)
+        .chain(traced_modules.await?.iter().copied().map(Either::Right))
+    {
+        let filepath = match asset {
+            Either::Left(asset) => asset.path().owned().await?,
+            Either::Right(module) => module.ident().await?.path.clone(),
+        };
+        if filepath.path.ends_with(".map") || filepath.path.ends_with(".nft.json") {
             // Skip source maps.
             continue;
         }
 
+        let filename = filepath.to_string_ref().await?;
+
         let output_file_index = builder.add_output_file(AnalyzeOutputFile { filename });
-        let chunk_parts = split_output_asset_into_parts(*asset).await?;
+        let chunk_parts = match asset {
+            Either::Left(v) => split_output_asset_into_parts(*v).await?,
+            Either::Right(v) => split_traced_module_into_parts(*v).await?,
+        };
         for chunk_part in &chunk_parts {
             let decoded_source = urlencoding::decode(&chunk_part.source)?;
             let source = if let Some(stripped) = decoded_source.strip_prefix(&prefix) {
@@ -597,6 +629,7 @@ pub async fn analyze_module_graphs(module_graph: Vc<ModuleGraph>) -> Result<Vc<F
 pub struct AnalyzeDataOutputAsset {
     pub path: FileSystemPath,
     pub output_assets: ResolvedVc<OutputAssets>,
+    pub traced_modules: ResolvedVc<Modules>,
 }
 
 #[turbo_tasks::value_impl]
@@ -605,10 +638,12 @@ impl AnalyzeDataOutputAsset {
     pub async fn new(
         path: FileSystemPath,
         output_assets: ResolvedVc<OutputAssets>,
+        traced_modules: ResolvedVc<Modules>,
     ) -> Result<Vc<Self>> {
         Ok(Self {
             path,
             output_assets,
+            traced_modules,
         }
         .cell())
     }
@@ -618,7 +653,7 @@ impl AnalyzeDataOutputAsset {
 impl Asset for AnalyzeDataOutputAsset {
     #[turbo_tasks::function]
     fn content(&self) -> Vc<AssetContent> {
-        let file_content = analyze_output_assets(*self.output_assets);
+        let file_content = analyze_output_assets(*self.output_assets, *self.traced_modules);
         AssetContent::file(file_content)
     }
 }

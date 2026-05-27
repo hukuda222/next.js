@@ -1,12 +1,15 @@
 use std::mem::replace;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bincode::{Decode, Encode};
 use turbo_rcstr::RcStr;
-use turbo_tasks::{FxIndexMap, NonLocalValue, ResolvedVc, ValueToString, Vc, trace::TraceRawVcs};
+use turbo_tasks::{
+    FxIndexMap, NonLocalValue, ResolvedVc, ValueToString, ValueToStringRef, Vc, trace::TraceRawVcs,
+};
 use turbo_tasks_fs::{FileContent, FileLine, FileLinesContent, rope::Rope};
 use turbopack_core::{
     asset::{Asset, AssetContent},
+    module::Module,
     output::OutputAsset,
     source_map::{GenerateSourceMap, OriginalToken, SourceMap, Token},
 };
@@ -56,6 +59,27 @@ impl ChunkPart {
 pub struct ChunkParts(Vec<ChunkPart>);
 
 #[turbo_tasks::function]
+pub async fn split_traced_module_into_parts(module: Vc<Box<dyn Module>>) -> Result<Vc<ChunkParts>> {
+    let source = module.source().await?.context("module has no source")?;
+    let content = source.content().await?;
+    let AssetContent::File(file_content) = &*content else {
+        return Ok(Vc::cell(vec![]));
+    };
+    let FileContent::Content(content) = &*file_content.await? else {
+        return Ok(Vc::cell(vec![]));
+    };
+    let content = content.content();
+    let lines_vc = file_content.lines().to_resolved().await?;
+
+    self_mapped(
+        module.ident().await?.path.to_string_ref().await?,
+        content,
+        lines_vc,
+    )
+    .await
+}
+
+#[turbo_tasks::function]
 pub async fn split_output_asset_into_parts(
     asset: Vc<Box<dyn OutputAsset>>,
 ) -> Result<Vc<ChunkParts>> {
@@ -72,11 +96,11 @@ pub async fn split_output_asset_into_parts(
     let Some(generate_source_map) =
         ResolvedVc::try_sidecast::<Box<dyn GenerateSourceMap>>(asset.to_resolved().await?)
     else {
-        return self_mapped(asset, content, lines_vc).await;
+        return self_mapped(asset.path().to_string().owned().await?, content, lines_vc).await;
     };
     let source_map = generate_source_map.generate_source_map().await?;
     let Some(source_map) = source_map.as_content() else {
-        return self_mapped(asset, content, lines_vc).await;
+        return self_mapped(asset.path().to_string().owned().await?, content, lines_vc).await;
     };
     let Some(source_map) = SourceMap::new_from_rope(source_map.content())? else {
         return unaccounted(asset, content, lines_vc).await;
@@ -375,14 +399,14 @@ pub async fn split_output_asset_into_parts(
     Ok(Vc::cell(chunk_parts.into_values().collect()))
 }
 
-async fn self_mapped(
-    asset: Vc<Box<dyn OutputAsset>>,
+pub async fn self_mapped(
+    path: RcStr,
     content: &Rope,
     lines: ResolvedVc<FileLinesContent>,
 ) -> Result<Vc<ChunkParts>> {
     let len = content.len().try_into().unwrap_or(u32::MAX);
     Ok(Vc::cell(vec![ChunkPart {
-        source: asset.path().to_string().owned().await?,
+        source: path,
         real_size: len,
         unaccounted_size: 0,
         ranges: vec![],

@@ -70,12 +70,14 @@ async fn get_analyze_data_operation(
     // Collect output assets from _app and _document to merge into each route's
     // analyze.data so their modules are visible in every route's treemap.
     let mut combined_output_assets: Vec<ResolvedVc<Box<dyn OutputAsset>>> = vec![];
+    let mut combined_traced_modules: Vec<ResolvedVc<Box<dyn Module>>> = vec![];
     for (key, endpoint_group) in endpoint_groups.iter() {
         if matches!(
             key,
             EndpointGroupKey::PagesApp | EndpointGroupKey::PagesDocument
         ) {
             combined_output_assets.extend(endpoint_group.output_assets().await?.iter().copied());
+            combined_traced_modules.extend(endpoint_group.traced_modules().await?.iter().copied());
         }
     }
 
@@ -96,11 +98,23 @@ async fn get_analyze_data_operation(
             } else {
                 endpoint_group.output_assets()
             };
+            let traced_modules = if has_combined
+                && !matches!(
+                    key,
+                    EndpointGroupKey::PagesApp | EndpointGroupKey::PagesDocument
+                ) {
+                // Combine route traced modules with _app and _document traced modules so
+                // the generated analyze.data already includes their modules.
+                combine_traced_modules(endpoint_group.traced_modules(), combined_vc)
+            } else {
+                endpoint_group.traced_modules()
+            };
             let analyze_data = AnalyzeDataOutputAsset::new(
                 analyze_output_root
                     .join(&key.to_string())?
                     .join("analyze.data")?,
                 output_assets,
+                traced_modules,
             )
             .to_resolved()
             .await?;
