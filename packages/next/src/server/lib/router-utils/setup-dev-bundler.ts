@@ -6,6 +6,7 @@ import type { RoutesManifest } from '../../../build'
 import type { MiddlewareRouteMatch } from '../../../shared/lib/router/utils/middleware-route-matcher'
 import type { PropagateToWorkersField } from './types'
 import type { NextJsHotReloaderInterface } from '../../dev/hot-reloader-types'
+import type { RouteDefinition } from '../../route-definitions/route-definition'
 
 import { createDefineEnv } from '../../../build/swc'
 import { installBindings } from '../../../build/swc/install-bindings'
@@ -14,6 +15,7 @@ import path from 'path'
 import qs from 'querystring'
 import Watchpack from 'next/dist/compiled/watchpack'
 import findUp from 'next/dist/compiled/find-up'
+import { cyan } from '../../../lib/picocolors'
 import { buildCustomRoute } from './filesystem'
 import * as Log from '../../../build/output/log'
 import { setGlobal } from '../../../trace/shared'
@@ -26,11 +28,16 @@ import {
 } from '../../../telemetry/events'
 import { getSortedRoutes } from '../../../shared/lib/router/utils'
 import { sortByPageExts } from '../../../build/sort-by-page-exts'
+import { normalizeCatchAllRoutes } from './normalize-catchall-routes'
 import { verifyAndRunTypeScript } from '../../../lib/verify-typescript-setup'
 import { verifyPartytownSetup } from '../../../lib/verify-partytown-setup'
 import { getNamedRouteRegex } from '../../../shared/lib/router/utils/route-regex'
-import { buildDataRoute } from './build-data-route'
+import {
+  addLocalePrefixToDataRouteRegex,
+  buildDataRoute,
+} from './build-data-route'
 import { getRouteMatcher } from '../../../shared/lib/router/utils/route-matcher'
+import { normalizePagePath } from '../../../shared/lib/page-path/normalize-page-path'
 import { normalizePathSep } from '../../../shared/lib/page-path/normalize-path-sep'
 import { createClientRouterFilter } from '../../../lib/create-client-router-filter'
 import { absolutePathToPage } from '../../../shared/lib/page-path/absolute-path-to-page'
@@ -83,6 +90,7 @@ import {
   PROXY_FILENAME,
 } from '../../../lib/constants'
 import { parseUrl } from '../../../lib/url'
+import { isAPIRoute } from '../../../lib/is-api-route'
 import {
   createRouteTypesManifest,
   writeRouteTypesManifest,
@@ -102,6 +110,7 @@ import {
 import { ensureLeadingSlash } from '../../../shared/lib/page-path/ensure-leading-slash'
 import { Lockfile, type DevServerInfo } from '../../../build/lockfile'
 import { deobfuscateText } from '../../../shared/lib/magic-identifier'
+import { RouteKind } from '../../route-kind'
 
 export type SetupOpts = {
   renderServer: LazyRenderServerInstance
@@ -150,6 +159,20 @@ export type ServerFields = {
   >[]
   setIsrStatus?: (key: string, value: boolean | undefined) => void
   resetFetch?: () => void
+}
+
+function getAppPathDefinitionPage(
+  pathname: string,
+  appPaths: readonly string[]
+): string {
+  for (let i = appPaths.length - 1; i >= 0; i--) {
+    const appPath = appPaths[i]
+    if (normalizeAppPath(appPath) === pathname) {
+      return appPath
+    }
+  }
+
+  return appPaths[appPaths.length - 1]
 }
 
 async function verifyTypeScript(opts: SetupOpts) {
@@ -338,11 +361,13 @@ async function startWatcher(
 
   opts.fsChecker.ensureCallback(async function ensure(item) {
     if (item.type === 'appFile' || item.type === 'pageFile') {
+      const definition = item.route
       await hotReloader.ensurePage({
         clientOnly: false,
-        page: item.itemPath,
+        page: definition?.page ?? item.itemPath,
         isApp: item.type === 'appFile',
-        definition: undefined,
+        definition,
+        url: item.requestPath,
       })
     }
   })
@@ -414,6 +439,7 @@ async function startWatcher(
     let enabledTypeScript = await verifyTypeScript(opts)
     let previousClientRouterFilters: any
     let previousConflictingPagePaths: Set<string> = new Set()
+    let previousDuplicatePagePaths: Set<string> = new Set()
 
     const routeTypesFilePath = path.join(distDir, 'types', 'routes.d.ts')
     const validatorFilePath = path.join(distDir, 'types', 'validator.ts')
@@ -428,7 +454,9 @@ async function startWatcher(
       const appPaths: Record<string, string[]> = {}
       const pageNameSet = new Set<string>()
       const conflictingAppPagePaths = new Set<string>()
+      const duplicatePagePaths = new Set<string>()
       const appPageFilePaths = new Map<string, string>()
+      const appRouteFilePaths = new Map<string, string>()
       const pagesPageFilePaths = new Map<string, string>()
       const appRouteHandlers: RouteInfo[] = []
       const pageApiRoutes: RouteInfo[] = []
@@ -525,11 +553,21 @@ async function startWatcher(
           continue
         }
 
+        const fileExists = fs.existsSync(fileName)
         if (
-          meta?.accuracy === undefined ||
-          !validFileMatcher.isPageFile(fileName)
+          !validFileMatcher.isPageFile(fileName) ||
+          (meta?.accuracy === undefined && !fileExists)
         ) {
           continue
+        }
+        if (fileExists) {
+          try {
+            if (!fs.statSync(fileName).isFile()) {
+              continue
+            }
+          } catch {
+            continue
+          }
         }
 
         const isAppPath = Boolean(
@@ -687,6 +725,12 @@ async function startWatcher(
               ? originalPageName.replace(/%5F/g, '_')
               : originalPageName
           )
+          appRouteFilePaths.set(
+            opts.turbo
+              ? originalPageName.replace(/%5F/g, '_')
+              : originalPageName,
+            fileName
+          )
 
           if (useFileSystemPublicRoutes) {
             if (appDir && isStaticMetadataFile(fileName.replace(appDir, ''))) {
@@ -712,6 +756,31 @@ async function startWatcher(
           if (routedPages.includes(pageName)) continue
         } else {
           // Pages router
+          const existingPageFilePath = pagesPageFilePaths.get(pageName)
+          if (pagesDir && existingPageFilePath) {
+            duplicatePagePaths.add(pageName)
+
+            if (!previousDuplicatePagePaths.has(pageName)) {
+              const existingPagePath = normalizePathSep(
+                path.join(
+                  'pages',
+                  path.relative(pagesDir, existingPageFilePath)
+                )
+              )
+              const duplicatePagePath = normalizePathSep(
+                path.join('pages', path.relative(pagesDir, fileName))
+              )
+
+              Log.warn(
+                `Duplicate page detected. ${cyan(
+                  existingPagePath
+                )} and ${cyan(duplicatePagePath)} both resolve to ${cyan(
+                  pageName
+                )}.`
+              )
+            }
+          }
+
           if (useFileSystemPublicRoutes) {
             pageFiles.add(pageName)
             opts.fsChecker.nextDataRoutes.add(pageName)
@@ -719,7 +788,7 @@ async function startWatcher(
 
           const route = normalizePathSep(pageName)
           const routeEntry = { route, filePath: fileName }
-          if (pageName.startsWith('/api/')) {
+          if (isAPIRoute(pageName)) {
             pageApiRoutes.push(routeEntry)
           } else {
             pageRoutes.push(routeEntry)
@@ -768,11 +837,11 @@ async function startWatcher(
           hotReloader.setHmrServerError(new Error(errorMessage))
         } else if (numConflicting === 0) {
           hotReloader.clearHmrServerError()
-          await propagateServerField(opts, 'reloadMatchers', undefined)
         }
       }
 
       previousConflictingPagePaths = conflictingAppPagePaths
+      previousDuplicatePagePaths = duplicatePagePaths
 
       let clientRouterFilters: any
       if (nextConfig.experimental.clientRouterFilter) {
@@ -955,6 +1024,8 @@ async function startWatcher(
         nestedMiddleware = []
       }
 
+      normalizeCatchAllRoutes(appPaths)
+
       // Make sure to sort parallel routes to make the result deterministic.
       serverFields.appPathRoutes = Object.fromEntries(
         Object.entries(appPaths).map(([k, v]) => [k, v.sort(compareAppPaths)])
@@ -964,6 +1035,53 @@ async function startWatcher(
         'appPathRoutes',
         serverFields.appPathRoutes
       )
+
+      const pageRouteDefinitions = [
+        ...pageRoutes.map(({ route, filePath }) => ({
+          kind: RouteKind.PAGES,
+          pathname: route,
+          page: route,
+          bundlePath: path.posix.join('pages', normalizePagePath(route)),
+          filename: filePath,
+          ...(opts.nextConfig.i18n ? { i18n: {} } : undefined),
+        })),
+        ...pageApiRoutes.map(({ route, filePath }) => ({
+          kind: RouteKind.PAGES_API,
+          pathname: route,
+          page: route,
+          bundlePath: path.posix.join('pages', normalizePagePath(route)),
+          filename: filePath,
+          ...(opts.nextConfig.i18n ? { i18n: {} } : undefined),
+        })),
+      ] as RouteDefinition[]
+
+      const appRouteDefinitions = [
+        ...Object.entries(appPaths).map(([route, routeAppPaths]) => {
+          const page = getAppPathDefinitionPage(route, routeAppPaths)
+          const filePath = appRouteFilePaths.get(page)!
+          return {
+            kind: RouteKind.APP_PAGE,
+            pathname: route,
+            page,
+            bundlePath: path.posix.join('app', normalizePagePath(page)),
+            filename: filePath,
+            appPaths: routeAppPaths,
+          }
+        }),
+        ...appRouteHandlers.map(({ route, filePath }) => {
+          const page = appPaths[route]?.[0] ?? route
+          return {
+            kind: RouteKind.APP_ROUTE,
+            pathname: route,
+            page,
+            bundlePath: path.posix.join('app', normalizePagePath(page)),
+            filename: filePath,
+          }
+        }),
+      ] as RouteDefinition[]
+
+      opts.fsChecker.setRouteDefinitions('pageFile', pageRouteDefinitions)
+      opts.fsChecker.setRouteDefinitions('appFile', appRouteDefinitions)
 
       // TODO: pass this to fsChecker/next-dev-server?
       serverFields.middleware = middlewareMatchers
@@ -1038,6 +1156,8 @@ async function startWatcher(
           (page): FilesystemDynamicRoute => {
             const regex = getNamedRouteRegex(page, {
               prefixRouteKeys: true,
+              includePrefix: true,
+              includeSuffix: true,
             })
             return {
               regex: regex.re.toString(),
@@ -1066,9 +1186,9 @@ async function startWatcher(
               // upstream builder that relies on this
               re: opts.nextConfig.i18n
                 ? new RegExp(
-                    route.dataRouteRegex.replace(
-                      `/development/`,
-                      `/development/(?<nextLocale>[^/]+?)/`
+                    addLocalePrefixToDataRouteRegex(
+                      route.dataRouteRegex,
+                      'development'
                     )
                   )
                 : new RegExp(route.dataRouteRegex),
@@ -1081,12 +1201,6 @@ async function startWatcher(
         // For Turbopack ADDED_PAGE and REMOVED_PAGE are implemented in hot-reloader-turbopack.ts
         // in order to avoid a race condition where ADDED_PAGE and REMOVED_PAGE are sent before Turbopack picked up the file change.
         if (!opts.turbo) {
-          // Reload the matchers. The filesystem would have been written to,
-          // and the matchers need to re-scan it to update the router.
-          // Reloading the matchers should happen before `ADDED_PAGE` or `REMOVED_PAGE` is sent over the websocket
-          // otherwise it sends the event too early.
-          await propagateServerField(opts, 'reloadMatchers', undefined)
-
           if (
             !prevSortedRoutes?.every((val, idx) => val === sortedRoutes[idx])
           ) {
