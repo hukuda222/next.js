@@ -552,7 +552,7 @@ function LayerIcon({ layer }: { layer: string }) {
     )
   } else if (layer.includes('app')) {
     return (
-      <div title="App Router">
+      <div title={`App Router (${layer})`}>
         <Box className="w-3 h-3 text-green-500" />
       </div>
     )
@@ -564,7 +564,7 @@ function LayerIcon({ layer }: { layer: string }) {
     )
   } else {
     return (
-      <div title="Pages Router">
+      <div title={`Pages Router (${layer})`}>
         <File className="w-3 h-3 text-purple-500" />
       </div>
     )
