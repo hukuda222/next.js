@@ -75,6 +75,7 @@ pub async fn trace_endpoint(
                 .await?
                 .map(|v| *v),
             false,
+            Some(next_config.config_file_path(project_path.clone())),
         )
         .await?;
 

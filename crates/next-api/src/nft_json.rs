@@ -15,11 +15,13 @@ use turbo_tasks_hash::HashAlgorithm;
 use turbopack_core::{
     asset::{Asset, AssetContent},
     chunk::{ChunkingType, TracedMode},
+    file_source::FileSource,
     ident::AssetIdent,
-    issue::{Issue, IssueExt, IssueSeverity, IssueStage, StyledString},
+    issue::{Issue, IssueExt, IssueSeverity, IssueSource, IssueStage, StyledString},
     module::{Module, Modules},
     module_graph::{GraphTraversalAction, ModuleGraph},
     output::{OutputAsset, OutputAssets, OutputAssetsReference},
+    raw_module::RawModule,
 };
 
 use crate::{
@@ -125,11 +127,6 @@ impl Asset for NftJsonAsset {
             let output_root_ref = this.project.output_fs().root().await?;
             let project_root_ref = this.project.project_fs().root().await?;
             let next_config = this.project.next_config();
-            let next_config_path = this
-                .project
-                .next_config()
-                .config_file_path(project_path.clone())
-                .await?;
 
             let client_root = this.project.client_fs().root();
             let client_root = client_root.owned().await?;
@@ -204,18 +201,6 @@ impl Asset for NftJsonAsset {
                         Either::Left(p) => &**p,
                         Either::Right(p) => p,
                     };
-
-                    if let AssetOrModule::Module(_) = referenced
-                        && referenced_chunk_path == &*next_config_path
-                    {
-                        // If next.config.js was traced, assume that the whole project was traced
-                        // (unintentionally). Print a message in this case to avoid deploying
-                        // unnecessary files.
-                        ForbiddenTracedFileIssue::new(referenced_chunk_path.clone())
-                            .to_resolved()
-                            .await?
-                            .emit();
-                    }
 
                     if referenced_chunk_path.has_extension(".map") {
                         return Ok(None);
@@ -315,6 +300,7 @@ pub async fn traced_modules_for_entries(
     entry_modules: Vc<Modules>,
     exclude_glob: Option<Vc<Glob>>,
     entries_are_traced: bool,
+    forbidden_path: Option<Vc<FileSystemPath>>,
 ) -> Result<Vc<Modules>> {
     let exclude_glob = if let Some(exclude_glob) = exclude_glob {
         Some(exclude_glob.await?)
@@ -328,6 +314,18 @@ pub async fn traced_modules_for_entries(
         None
     };
 
+    let forbidden_module = if let Some(forbidden_path) = forbidden_path {
+        Some(ResolvedVc::upcast(
+            RawModule::new(Vc::upcast(FileSource::new(forbidden_path.owned().await?)))
+                .to_resolved()
+                .await?,
+        ))
+    } else {
+        None
+    };
+
+    let mut forbidden_issues = vec![];
+
     let mut traced_modules = FxIndexSet::default();
     module_graph.await?.traverse_edges_dfs(
         entry_modules.await?.iter().copied(),
@@ -339,6 +337,10 @@ pub async fn traced_modules_for_entries(
                 }
                 return Ok(GraphTraversalAction::Continue);
             };
+
+            if forbidden_module.is_some_and(|m| m == target) {
+                forbidden_issues.push((parent, ref_data.reference));
+            }
 
             if should_visit_for_tracing(&ref_data.chunking_type, traced_modules.contains(&parent)) {
                 if let Some(exclude_glob) = &exclude_glob
@@ -361,6 +363,16 @@ pub async fn traced_modules_for_entries(
         |_, _, _| Ok(()),
         true,
     )?;
+
+    for (parent, reference) in forbidden_issues {
+        ForbiddenTracedFileIssue::new(
+            parent.ident().await?.path.clone(),
+            reference.into_trait_ref().await?.source(),
+        )
+        .to_resolved()
+        .await?
+        .emit();
+    }
 
     Ok(Vc::cell(traced_modules.into_iter().collect()))
 }
@@ -518,14 +530,22 @@ pub async fn all_assets_from_entries_filtered(
 
 #[turbo_tasks::value(shared)]
 struct ForbiddenTracedFileIssue {
-    file: FileSystemPath,
+    parent: FileSystemPath,
+    issue_source: Option<IssueSource>,
 }
 
 #[turbo_tasks::value_impl]
 impl ForbiddenTracedFileIssue {
     #[turbo_tasks::function]
-    pub fn new(file: FileSystemPath) -> Vc<Self> {
-        Self { file }.cell()
+    pub async fn new(
+        parent: FileSystemPath,
+        issue_source: Option<IssueSource>,
+    ) -> Result<Vc<Self>> {
+        Ok(Self {
+            parent,
+            issue_source,
+        }
+        .cell())
     }
 }
 
@@ -542,8 +562,12 @@ impl Issue for ForbiddenTracedFileIssue {
         IssueStage::Misc
     }
 
+    fn source(&self) -> Option<IssueSource> {
+        self.issue_source
+    }
+
     async fn file_path(&self) -> Result<FileSystemPath> {
-        Ok(self.file.clone())
+        Ok(self.parent.clone())
     }
 
     async fn title(&self) -> Result<StyledString> {
@@ -555,8 +579,9 @@ impl Issue for ForbiddenTracedFileIssue {
     async fn description(&self) -> Result<Option<StyledString>> {
         let stack = vec![
             StyledString::Text(rcstr!(
-                "A file was traced that indicates that the whole project was traced \
-                 unintentionally. Somewhere in the import trace below, there are:"
+                "This import traced the next.config.js file which indicates that the whole \
+                 project was traced unintentionally. Somewhere in the import trace below, there \
+                 are:"
             )),
             StyledString::Line(vec![
                 StyledString::Text(rcstr!("- filesystem operations (like ")),
