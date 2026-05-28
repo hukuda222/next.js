@@ -11,6 +11,7 @@ import {
   Server,
   Globe,
   MessageCircleQuestion,
+  Package,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type {
@@ -423,19 +424,7 @@ export function ImportChain({
               {currentItemInfo?.isAsync && <div className="h-8" />}
               <div className="flex items-center gap-2">
                 <div className="flex flex-col gap-1 items-center">
-                  {!level.layer ? (
-                    <div title="Unknown">
-                      <MessageCircleQuestion className="w-3 h-3 text-gray-500" />
-                    </div>
-                  ) : /app/.test(level.layer || '') ? (
-                    <div title="App Router">
-                      <Box className="w-3 h-3 text-green-500" />
-                    </div>
-                  ) : (
-                    <div title="Pages Router">
-                      <File className="w-3 h-3 text-purple-500" />
-                    </div>
-                  )}
+                  <LayerIcon layer={level.layer || ''} />
                 </div>
 
                 <div className="flex-1 border border-border rounded px-2 py-1 bg-background">
@@ -552,4 +541,32 @@ export function ImportChain({
       </div>
     </div>
   )
+}
+
+function LayerIcon({ layer }: { layer: string }) {
+  if (!layer || layer === 'external') {
+    return (
+      <div title="Unknown">
+        <MessageCircleQuestion className="w-3 h-3 text-gray-500" />
+      </div>
+    )
+  } else if (layer.includes('app')) {
+    return (
+      <div title="App Router">
+        <Box className="w-3 h-3 text-green-500" />
+      </div>
+    )
+  } else if (layer === 'externals-tracing') {
+    return (
+      <div title="External Asset">
+        <Package className="w-3 h-3" />
+      </div>
+    )
+  } else {
+    return (
+      <div title="Pages Router">
+        <File className="w-3 h-3 text-purple-500" />
+      </div>
+    )
+  }
 }
