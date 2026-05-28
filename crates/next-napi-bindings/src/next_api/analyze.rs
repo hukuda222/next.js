@@ -2,11 +2,14 @@ use std::{iter::once, sync::Arc};
 
 use anyhow::Result;
 use next_api::{
-    analyze::{AnalyzeDataOutputAsset, ModulesDataOutputAsset, combine_output_assets},
+    analyze::{
+        AnalyzeDataOutputAsset, ModulesDataOutputAsset, combine_output_assets, combine_traced_files,
+    },
     project::ProjectContainer,
     route::EndpointGroupKey,
 };
 use turbo_tasks::{Effects, ReadRef, ResolvedVc, TryJoinIterExt, Vc};
+use turbo_tasks_fs::FileSystemPath;
 use turbopack_core::{
     issue::PlainIssue,
     output::{OutputAsset, OutputAssets},
@@ -70,19 +73,20 @@ async fn get_analyze_data_operation(
     // Collect output assets from _app and _document to merge into each route's
     // analyze.data so their modules are visible in every route's treemap.
     let mut combined_output_assets: Vec<ResolvedVc<Box<dyn OutputAsset>>> = vec![];
-    let mut combined_traced_modules: Vec<ResolvedVc<Box<dyn Module>>> = vec![];
+    let mut combined_traced_files: Vec<FileSystemPath> = vec![];
     for (key, endpoint_group) in endpoint_groups.iter() {
         if matches!(
             key,
             EndpointGroupKey::PagesApp | EndpointGroupKey::PagesDocument
         ) {
             combined_output_assets.extend(endpoint_group.output_assets().await?.iter().copied());
-            combined_traced_modules.extend(endpoint_group.traced_modules().await?.iter().copied());
+            combined_traced_files.extend(endpoint_group.traced_files().await?.iter().cloned());
         }
     }
 
     let has_combined = !combined_output_assets.is_empty();
-    let combined_vc = Vc::cell(combined_output_assets);
+    let combined_assets_vc = Vc::cell(combined_output_assets);
+    let combined_traced_vc = Vc::cell(combined_traced_files);
 
     let analyze_data = endpoint_groups
         .iter()
@@ -94,27 +98,27 @@ async fn get_analyze_data_operation(
                 ) {
                 // Combine route output assets with _app and _document output assets so
                 // the generated analyze.data already includes their modules.
-                combine_output_assets(endpoint_group.output_assets(), combined_vc)
+                combine_output_assets(endpoint_group.output_assets(), combined_assets_vc)
             } else {
                 endpoint_group.output_assets()
             };
-            let traced_modules = if has_combined
+            let traced_files = if has_combined
                 && !matches!(
                     key,
                     EndpointGroupKey::PagesApp | EndpointGroupKey::PagesDocument
                 ) {
-                // Combine route traced modules with _app and _document traced modules so
+                // Combine route traced files with _app and _document traced modules so
                 // the generated analyze.data already includes their modules.
-                combine_traced_modules(endpoint_group.traced_modules(), combined_vc)
+                combine_traced_files(endpoint_group.traced_files(), combined_traced_vc)
             } else {
-                endpoint_group.traced_modules()
+                endpoint_group.traced_files()
             };
             let analyze_data = AnalyzeDataOutputAsset::new(
                 analyze_output_root
                     .join(&key.to_string())?
                     .join("analyze.data")?,
                 output_assets,
-                traced_modules,
+                traced_files,
             )
             .to_resolved()
             .await?;

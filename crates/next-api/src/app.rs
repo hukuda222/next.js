@@ -1748,8 +1748,7 @@ impl AppEndpoint {
                                 .chain(loadable_manifest_output.iter().flat_map(|m| &**m).copied())
                                 .map(|m| *m)
                                 .collect(),
-                            *module_graphs.full,
-                            vec![*rsc_entry],
+                            self.trace_result(),
                         )
                         .to_resolved()
                         .await?,
@@ -1938,7 +1937,7 @@ impl AppEndpoint {
     }
 
     #[turbo_tasks::function]
-    async fn traced_files(self: Vc<Self>) -> Result<Vc<EndpointTraceResult>> {
+    async fn trace_result(self: Vc<Self>) -> Result<Vc<EndpointTraceResult>> {
         let this = self.await?;
         let app_entry = self.app_endpoint_entry().await?;
 
@@ -1956,31 +1955,9 @@ impl AppEndpoint {
             )
             .await?;
 
-        let app_entry_chunks = self
-            .app_entry_chunks(
-                *client_references,
-                *server_action_manifest_loader,
-                server_path.clone(),
-                process_client_assets,
-                *module_graphs.full,
-            )
-            .to_resolved()
-            .await?;
-        let app_entry_chunk_group_ref = app_entry_chunks.await?;
-        let app_entry_chunks = app_entry_chunk_group_ref.assets;
-        let app_entry_chunks_ref = app_entry_chunks.await?;
-        let rsc_chunk = *app_entry_chunks_ref.first().unwrap();
-
         Ok(trace_endpoint(
             this.app_project.project(),
             Some(app_function_name(&app_entry.original_name).into()),
-            *rsc_chunk,
-            client_reference_manifest
-                .iter()
-                .copied()
-                .chain(loadable_manifest_output.iter().flat_map(|m| &**m).copied())
-                .map(|m| *m)
-                .collect(),
             *module_graphs.full,
             vec![*rsc_entry],
         ))
@@ -2206,6 +2183,11 @@ impl Endpoint for AppEndpoint {
     #[turbo_tasks::function]
     async fn project(self: Vc<Self>) -> Result<Vc<Project>> {
         Ok(self.await?.app_project.project())
+    }
+
+    #[turbo_tasks::function]
+    fn traced_files(self: Vc<Self>) -> Vc<FileSystemPathVec> {
+        self.trace_result().all_files()
     }
 }
 

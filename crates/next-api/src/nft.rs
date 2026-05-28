@@ -5,170 +5,93 @@ use std::{
 
 use anyhow::{Context, Result};
 use bincode::{Decode, Encode};
-use either::Either;
-use itertools::Itertools;
+use next_core::{app_structure::FileSystemPathVec, next_config::NextConfig};
 use tracing::Instrument;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    FxIndexMap, NonLocalValue, ResolvedVc, TryFlatJoinIterExt, TryJoinIterExt, ValueToString, Vc,
+    FxIndexMap, NonLocalValue, ResolvedVc, TryFlatJoinIterExt, TryJoinIterExt, Vc,
     trace::TraceRawVcs,
 };
 use turbo_tasks_fs::{
-    DirectoryEntry, FileSystem, FileSystemPath,
+    DirectoryEntry, FileSystemPath,
     glob::{Glob, GlobOptions},
 };
-use turbopack_core::{module::Module, module_graph::ModuleGraph, output::OutputAsset};
+use turbopack_core::{module::Module, module_graph::ModuleGraph};
 
 use crate::{
     nft_json::{
-        all_assets_from_entries_filtered, relativize_glob, traced_module_data_for_graph,
-        traced_modules_for_entries,
+        TracedModuleData, relativize_glob, traced_module_data_for_graph, traced_modules_for_entries,
     },
     project::Project,
 };
 
 #[turbo_tasks::value]
 pub struct EndpointTraceResult {
-    pub chunks: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
     pub modules: Vec<ResolvedVc<Box<dyn Module>>>,
-    pub includes: Vec<SortableFileSystemPath>,
+    pub includes: Vec<FileSystemPath>,
+    pub module_data: ResolvedVc<TracedModuleData>,
+}
+
+#[turbo_tasks::value_impl]
+impl EndpointTraceResult {
+    #[turbo_tasks::function]
+    pub async fn all_files(&self) -> Result<Vc<FileSystemPathVec>> {
+        let module_data = self.module_data.await?;
+        Ok(Vc::cell(
+            self.includes
+                .iter()
+                .cloned()
+                .chain(
+                    self.modules
+                        .iter()
+                        .map(async |m| Ok(module_data.idents.get(m).await?.unwrap().path.clone()))
+                        .try_join()
+                        .await?,
+                )
+                .collect(),
+        ))
+    }
 }
 
 #[turbo_tasks::function]
 pub async fn trace_endpoint(
     project: ResolvedVc<Project>,
     page_name: Option<RcStr>,
-    chunk: ResolvedVc<Box<dyn OutputAsset>>,
-    additional_assets: Vec<ResolvedVc<Box<dyn OutputAsset>>>,
     module_graph: ResolvedVc<ModuleGraph>,
     entry_modules: Vec<ResolvedVc<Box<dyn Module>>>,
 ) -> Result<Vc<EndpointTraceResult>> {
-    let span = tracing::info_span!(
-        "trace endpoint",
-        path = display(chunk.path().to_string().await?)
-    );
-    async move {
+    let span = tracing::info_span!("trace endpoint", path = debug(&page_name));
+    async {
         let project_path = project.project_path().owned().await?;
-
         let next_config = project.next_config();
 
         let output_file_tracing_includes = &*next_config.output_file_tracing_includes().await?;
-        let output_file_tracing_excludes = &*next_config.output_file_tracing_excludes().await?;
 
-        let client_root = project.client_fs().root();
-        let client_root = client_root.owned().await?;
-
-        // [project]/
-        let project_root_path = project.project_root_path().owned().await?;
-        // Example: [output]/apps/my-website/.next/server/app -- without the `page.js.nft.json`
-        let ident_folder = chunk.path().await?.parent();
-
-        let entries = additional_assets
-            .iter()
-            .copied()
-            .chain(std::iter::once(chunk))
-            .collect();
-
-        let exclude_glob = if let Some(route) = &page_name {
-            if let Some(excludes_config) = output_file_tracing_excludes {
-                let mut combined_excludes = BTreeSet::new();
-
-                if let Some(excludes_obj) = excludes_config.as_object() {
-                    for (glob_pattern, exclude_patterns) in excludes_obj {
-                        // Check if the route matches the glob pattern
-                        let glob = Glob::new(
-                            RcStr::from(glob_pattern.clone()),
-                            GlobOptions { contains: true },
-                        )
-                        .await?;
-                        if glob.matches(route)
-                            && let Some(patterns) = exclude_patterns.as_array()
-                        {
-                            for pattern in patterns {
-                                if let Some(pattern_str) = pattern.as_str() {
-                                    let (glob, root) =
-                                        relativize_glob(pattern_str, project_path.clone())?;
-                                    let glob = if root.path.is_empty() {
-                                        glob.to_string()
-                                    } else {
-                                        format!("{root}/{glob}")
-                                    };
-                                    combined_excludes.insert(glob);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if combined_excludes.is_empty() {
-                    None
-                } else {
-                    let glob = Glob::new(
-                        format!(
-                            "{{{}}}",
-                            combined_excludes
-                                .iter()
-                                .map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )
-                        .into(),
-                        GlobOptions { contains: true },
-                    );
-
-                    Some(glob)
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        enum AssetOrModule {
-            Asset(ResolvedVc<Box<dyn OutputAsset>>),
-            Module(ResolvedVc<Box<dyn Module>>),
-        }
-
-        // Collect referenced chunks (e.g. dynamic imports, etc).
-        let all_assets = all_assets_from_entries_filtered(
-            Vc::cell(entries),
-            Some(client_root.clone()),
-            exclude_glob,
-        )
-        .await?;
         // Collect referenced assets and externals from module graph
         let all_modules = traced_modules_for_entries(
             *module_graph,
             Vc::cell(entry_modules.clone()),
-            exclude_glob,
+            tracing_exclude_glob(page_name.clone(), project_path.clone(), next_config)
+                .await?
+                .map(|v| *v),
             false,
         )
         .await?;
 
-        let module_paths = traced_module_data_for_graph(*module_graph, false);
+        let module_data = traced_module_data_for_graph(*module_graph, false)
+            .to_resolved()
+            .await?;
+        let module_paths = module_data.await?.idents;
 
-        let result = all_assets
+        let modules = all_modules
             .iter()
-            .filter(|a| **a != chunk)
             .copied()
-            .map(AssetOrModule::Asset)
-            .chain(all_modules.iter().copied().map(AssetOrModule::Module))
-            .map(async |referenced| {
-                let referenced_chunk_path = match referenced {
-                    AssetOrModule::Asset(v) => Either::Left(v.path().await?),
-                    AssetOrModule::Module(v) => {
-                        let entry = module_paths
-                            .get(&v)
-                            .await?
-                            .context("missing path for module")?;
-                        Either::Right(entry.ident.path.clone())
-                    }
-                };
-                let referenced_chunk_path = match &referenced_chunk_path {
-                    Either::Left(p) => &**p,
-                    Either::Right(p) => p,
-                };
+            .map(async |module| {
+                let entry = module_paths
+                    .get(&module)
+                    .await?
+                    .context("missing path for module")?;
+                let referenced_chunk_path = &entry.path;
 
                 if referenced_chunk_path.has_extension(".map") {
                     return Ok(None);
@@ -205,14 +128,14 @@ pub async fn trace_endpoint(
                     }
                 }
 
-                Ok(Some(referenced))
+                Ok(Some(module))
             })
             .try_flat_join()
             .await?;
 
         // Apply outputFileTracingIncludes and outputFileTracingExcludes
         // Extract route from chunk path for pattern matching
-        let include_matches = if let Some(route) = &page_name {
+        let includes = if let Some(route) = &page_name {
             let mut combined_includes_by_root: FxIndexMap<FileSystemPath, Vec<&str>> =
                 FxIndexMap::default();
 
@@ -255,21 +178,15 @@ pub async fn trace_endpoint(
                 .try_join()
                 .await?;
 
-            includes.into_iter().flatten().collect()
+            includes.into_iter().flatten().map(|path| path.0).collect()
         } else {
             Default::default()
         };
 
-        let (chunks, modules): (Vec<_>, Vec<_>) =
-            result.into_iter().partition_map(|item| match item {
-                AssetOrModule::Asset(a) => Either::Left(a),
-                AssetOrModule::Module(m) => Either::Right(m),
-            });
-
         Ok(EndpointTraceResult {
-            chunks,
             modules,
-            includes: include_matches,
+            includes,
+            module_data,
         }
         .cell())
     }
@@ -309,6 +226,7 @@ async fn apply_includes(
     let glob_result = project_root_path.read_glob(glob).await?;
 
     // Walk the full glob_result using an explicit stack to avoid async recursion overheads.
+    // Use a BTreeSet to get determinstic order (return value of `read_glob` has random order).
     let mut result = BTreeSet::new();
     let mut stack = VecDeque::new();
     stack.push_back(glob_result);
@@ -329,4 +247,73 @@ async fn apply_includes(
         }
     }
     Ok(result)
+}
+
+#[turbo_tasks::value(transparent)]
+pub struct OptionGlob(Option<ResolvedVc<Glob>>);
+
+#[turbo_tasks::function]
+pub async fn tracing_exclude_glob(
+    page_name: Option<RcStr>,
+    project_path: FileSystemPath,
+    next_config: ResolvedVc<NextConfig>,
+) -> Result<Vc<OptionGlob>> {
+    Ok(if let Some(route) = &page_name {
+        let output_file_tracing_excludes = next_config.output_file_tracing_excludes().await?;
+        if let Some(excludes_config) = &*output_file_tracing_excludes {
+            let mut combined_excludes = BTreeSet::new();
+
+            if let Some(excludes_obj) = excludes_config.as_object() {
+                for (glob_pattern, exclude_patterns) in excludes_obj {
+                    // Check if the route matches the glob pattern
+                    let glob = Glob::new(
+                        RcStr::from(glob_pattern.clone()),
+                        GlobOptions { contains: true },
+                    )
+                    .await?;
+                    if glob.matches(route)
+                        && let Some(patterns) = exclude_patterns.as_array()
+                    {
+                        for pattern in patterns {
+                            if let Some(pattern_str) = pattern.as_str() {
+                                let (glob, root) =
+                                    relativize_glob(pattern_str, project_path.clone())?;
+                                let glob = if root.path.is_empty() {
+                                    glob.to_string()
+                                } else {
+                                    format!("{root}/{glob}")
+                                };
+                                combined_excludes.insert(glob);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if combined_excludes.is_empty() {
+                Vc::cell(None)
+            } else {
+                let glob = Glob::new(
+                    format!(
+                        "{{{}}}",
+                        combined_excludes
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                    .into(),
+                    GlobOptions { contains: true },
+                )
+                .to_resolved()
+                .await?;
+
+                Vc::cell(Some(glob))
+            }
+        } else {
+            Vc::cell(None)
+        }
+    } else {
+        Vc::cell(None)
+    })
 }

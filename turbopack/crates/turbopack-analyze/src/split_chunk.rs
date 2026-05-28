@@ -1,15 +1,15 @@
 use std::mem::replace;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bincode::{Decode, Encode};
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
     FxIndexMap, NonLocalValue, ResolvedVc, ValueToString, ValueToStringRef, Vc, trace::TraceRawVcs,
 };
-use turbo_tasks_fs::{FileContent, FileLine, FileLinesContent, rope::Rope};
+use turbo_tasks_fs::{FileContent, FileLine, FileLinesContent, FileSystemPath, rope::Rope};
 use turbopack_core::{
     asset::{Asset, AssetContent},
-    module::Module,
+    file_source::FileSource,
     output::OutputAsset,
     source_map::{GenerateSourceMap, OriginalToken, SourceMap, Token},
 };
@@ -59,8 +59,8 @@ impl ChunkPart {
 pub struct ChunkParts(Vec<ChunkPart>);
 
 #[turbo_tasks::function]
-pub async fn split_traced_module_into_parts(module: Vc<Box<dyn Module>>) -> Result<Vc<ChunkParts>> {
-    let source = module.source().await?.context("module has no source")?;
+pub async fn split_traced_file_into_parts(path: FileSystemPath) -> Result<Vc<ChunkParts>> {
+    let source = FileSource::new(path.clone());
     let content = source.content().await?;
     let AssetContent::File(file_content) = &*content else {
         return Ok(Vc::cell(vec![]));
@@ -71,12 +71,7 @@ pub async fn split_traced_module_into_parts(module: Vc<Box<dyn Module>>) -> Resu
     let content = content.content();
     let lines_vc = file_content.lines().to_resolved().await?;
 
-    self_mapped(
-        module.ident().await?.path.to_string_ref().await?,
-        content,
-        lines_vc,
-    )
-    .await
+    self_mapped(path.to_string_ref().await?, content, lines_vc).await
 }
 
 #[turbo_tasks::function]
