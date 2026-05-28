@@ -8,7 +8,9 @@ use next_api::{
     project::ProjectContainer,
     route::EndpointGroupKey,
 };
-use turbo_tasks::{Effects, ReadRef, ResolvedVc, TryJoinIterExt, Vc};
+use turbo_tasks::{
+    Effects, ReadRef, ResolvedVc, TryJoinIterExt, ValueToString, ValueToStringRef, Vc,
+};
 use turbo_tasks_fs::FileSystemPath;
 use turbopack_core::{
     issue::PlainIssue,
@@ -90,7 +92,7 @@ async fn get_analyze_data_operation(
 
     let analyze_data = endpoint_groups
         .iter()
-        .map(|(key, endpoint_group)| async move {
+        .map(async |(key, endpoint_group)| {
             let output_assets = if has_combined
                 && !matches!(
                     key,
@@ -113,6 +115,21 @@ async fn get_analyze_data_operation(
             } else {
                 endpoint_group.traced_files()
             };
+            // println!(
+            //     "Generating analyze.data for route group {key} with {:#?} and {:#?}",
+            //     output_assets
+            //         .await?
+            //         .iter()
+            //         .map(|m| m.path().to_string())
+            //         .try_join()
+            //         .await?,
+            //     traced_files
+            //         .await?
+            //         .iter()
+            //         .map(|m| m.to_string_ref())
+            //         .try_join()
+            //         .await?,
+            // );
             let analyze_data = AnalyzeDataOutputAsset::new(
                 analyze_output_root
                     .join(&key.to_string())?

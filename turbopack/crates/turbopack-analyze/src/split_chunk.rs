@@ -33,24 +33,32 @@ pub struct ChunkPart {
 }
 
 impl ChunkPart {
-    pub async fn get_compressed_size(&self) -> Result<u32> {
+    pub async fn get_compressed_size(&self) -> Result<Option<u32>> {
         let lines = &*self.lines.await?;
         let FileLinesContent::Lines(lines) = lines else {
-            return Ok(0);
+            return Ok(None);
         };
 
-        let mut all_range_content = String::new();
-        for range in &self.ranges {
-            append_content_between(
-                range.line,
-                range.start_column,
-                range.line,
-                range.end_column,
-                lines,
-                &mut all_range_content,
-            );
+        if self.ranges.is_empty() {
+            let mut all_content = String::new();
+            for line in lines {
+                all_content.push_str(&line.content);
+            }
+            Ok(Some(compressed_size_bytes(all_content)?))
+        } else {
+            let mut all_range_content = String::new();
+            for range in &self.ranges {
+                append_content_between(
+                    range.line,
+                    range.start_column,
+                    range.line,
+                    range.end_column,
+                    lines,
+                    &mut all_range_content,
+                );
+            }
+            Ok(Some(compressed_size_bytes(all_range_content)?))
         }
-        compressed_size_bytes(all_range_content.into())
     }
 }
 

@@ -439,7 +439,9 @@ pub async fn analyze_output_assets(
             Either::Right(path) => path.to_string_ref().await?,
         };
 
-        let output_file_index = builder.add_output_file(AnalyzeOutputFile { filename });
+        let output_file_index = builder.add_output_file(AnalyzeOutputFile {
+            filename: filename.clone(),
+        });
         let chunk_parts = match asset {
             Either::Left(asset) => split_output_asset_into_parts(*asset).await?,
             Either::Right(path) => split_traced_file_into_parts(path).await?,
@@ -448,6 +450,8 @@ pub async fn analyze_output_assets(
             let decoded_source = urlencoding::decode(&chunk_part.source)?;
             let source = if let Some(stripped) = decoded_source.strip_prefix(&prefix) {
                 Cow::Borrowed(stripped)
+            } else if decoded_source.starts_with("[project]/") {
+                decoded_source
             } else {
                 Cow::Owned(format!(
                     "[project]/{}",
@@ -455,11 +459,12 @@ pub async fn analyze_output_assets(
                 ))
             };
             let source_index = builder.ensure_source(&source).1;
+            let size = chunk_part.real_size + chunk_part.unaccounted_size;
             let chunk_part_index = builder.add_chunk_part(AnalyzeChunkPart {
                 source_index,
                 output_file_index,
-                size: chunk_part.real_size + chunk_part.unaccounted_size,
-                compressed_size: chunk_part.get_compressed_size().await?,
+                size,
+                compressed_size: chunk_part.get_compressed_size().await?.unwrap_or(size),
             });
             builder.add_chunk_part_to_output_file(output_file_index, chunk_part_index);
             builder.add_chunk_part_to_source(source_index, chunk_part_index);
@@ -583,10 +588,6 @@ pub async fn analyze_module_graphs(module_graph: Vc<ModuleGraph>) -> Result<Vc<F
         .map(mapper)
         .try_flat_join()
         .await?;
-    println!("all_modules: {all_modules:#?}");
-    println!("all_edges: {all_edges:#?}");
-    println!("all_async_edges: {all_async_edges:#?}");
-    println!("all_traced_edges: {all_traced_edges:#?}");
     for (from_ident, to_ident) in all_edges {
         let from_index = builder.get_module(&from_ident).1;
         let to_index = builder.get_module(&to_ident).1;
