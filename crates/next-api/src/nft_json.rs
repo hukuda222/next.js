@@ -118,47 +118,6 @@ fn get_output_specifier(
     bail!("NftJsonAsset: cannot handle filepath '{path_ref}'");
 }
 
-/// Apply outputFileTracingIncludes patterns to find additional files
-async fn apply_includes(
-    project_root_path: FileSystemPath,
-    glob: Vc<Glob>,
-    ident_folder: &FileSystemPath,
-) -> Result<BTreeMap<RcStr, ReadRef<RcStr>>> {
-    debug_assert_eq!(project_root_path.fs, ident_folder.fs);
-    // Read files matching the glob pattern from the project root
-    // This result itself has random order, but the BTreeSet will ensure a deterministic ordering.
-    let glob_result = project_root_path.read_glob(glob).await?;
-
-    // Walk the full glob_result using an explicit stack to avoid async recursion overheads.
-    let mut result = BTreeMap::new();
-    let mut stack = VecDeque::new();
-    stack.push_back(glob_result);
-    while let Some(glob_result) = stack.pop_back() {
-        // Process direct results (files and directories at this level)
-        for entry in glob_result.results.values() {
-            let (DirectoryEntry::File(file_path) | DirectoryEntry::Symlink(file_path)) = entry
-            else {
-                continue;
-            };
-
-            // Convert to relative path from ident_folder to the file
-            // unwrap is safe because project_root_path and ident_folder have the same filesystem
-            // and paths produced by read_glob stay in the filesystem
-            let relative_path = ident_folder.get_relative_path_to(file_path).unwrap();
-            result.insert(
-                relative_path,
-                file_path.read().hash(HashAlgorithm::Xxh3Hash128Hex).await?,
-            );
-        }
-
-        for nested_result in glob_result.inner.values() {
-            let nested_result_ref = nested_result.await?;
-            stack.push_back(nested_result_ref);
-        }
-    }
-    Ok(result)
-}
-
 #[turbo_tasks::value_impl]
 impl Asset for NftJsonAsset {
     #[turbo_tasks::function]
@@ -526,9 +485,9 @@ pub async fn traced_modules_for_entries(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, NonLocalValue, TraceRawVcs)]
-struct TracedModuleData {
-    ident: ReadRef<AssetIdent>,
-    hash: ReadRef<RcStr>,
+pub struct TracedModuleData {
+    pub ident: ReadRef<AssetIdent>,
+    pub hash: ReadRef<RcStr>,
 }
 
 #[turbo_tasks::value(transparent, cell = "keyed")]
@@ -536,7 +495,7 @@ struct TracedModuleDataMap(FxHashMap<ResolvedVc<Box<dyn Module>>, TracedModuleDa
 
 /// This caches the paths for all modules in the graph so that we don't have to do it once per page.
 #[turbo_tasks::function]
-async fn traced_module_data_for_graph(
+pub async fn traced_module_data_for_graph(
     module_graph: Vc<ModuleGraph>,
     entries_are_traced: bool,
 ) -> Result<Vc<TracedModuleDataMap>> {

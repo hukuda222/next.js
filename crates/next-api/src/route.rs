@@ -8,6 +8,7 @@ use turbo_tasks::{
     TryJoinIterExt, Vc, debug::ValueDebugFormat, trace::TraceRawVcs,
 };
 use turbopack_core::{
+    module::Modules,
     module_graph::{GraphEntries, ModuleGraph},
     output::OutputAssets,
 };
@@ -67,6 +68,12 @@ pub trait Endpoint {
     /// The project this endpoint belongs to.
     #[turbo_tasks::function]
     fn project(self: Vc<Self>) -> Vc<Project>;
+
+    /// The traced modules included by this endpoint. This is only used for analysis purposes.
+    /// Usually, `output()` includes the NFT file and everything else is handled outside of
+    /// Turbopack.
+    #[turbo_tasks::function]
+    fn traced_modules(self: Vc<Self>) -> Vc<Modules>;
 }
 
 #[derive(
@@ -154,6 +161,15 @@ impl EndpointGroup {
                 .collect(),
         )
     }
+
+    pub fn traced_modules(&self) -> Vc<Modules> {
+        traced_modules_of_endpoints(
+            self.primary
+                .iter()
+                .map(|endpoint| *endpoint.endpoint)
+                .collect(),
+        )
+    }
 }
 
 #[turbo_tasks::function]
@@ -180,6 +196,15 @@ async fn module_graphs_of_endpoints(
         .into_iter()
         .collect::<Vec<_>>();
     Ok(Vc::cell(module_graphs))
+}
+
+#[turbo_tasks::function]
+async fn traced_modules_of_endpoints(endpoints: Vec<Vc<Box<dyn Endpoint>>>) -> Result<Vc<Modules>> {
+    let mut modules: FxIndexSet<_> = FxIndexSet::default();
+    for endpoint in endpoints {
+        modules.extend(endpoint.traced_modules().await?.iter().copied());
+    }
+    Ok(Vc::cell(modules.into_iter().collect()))
 }
 
 #[turbo_tasks::value(transparent)]

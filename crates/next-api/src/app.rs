@@ -77,6 +77,7 @@ use crate::{
     font::FontManifest,
     loadable_manifest::create_react_loadable_manifest,
     module_graph::{ClientReferencesGraphs, NextDynamicGraphs, ServerActionsGraphs},
+    nft::{EndpointTraceResult, trace_endpoint},
     nft_json::NftJsonAsset,
     paths::{
         all_asset_paths, all_paths_in_root, get_asset_paths_from_root, get_js_paths_from_root,
@@ -1934,6 +1935,55 @@ impl AppEndpoint {
                 .await?
             }
         })
+    }
+
+    #[turbo_tasks::function]
+    async fn traced_files(self: Vc<Self>) -> Result<Vc<EndpointTraceResult>> {
+        let this = self.await?;
+        let app_entry = self.app_endpoint_entry().await?;
+
+        let rsc_entry = app_entry.rsc_entry;
+
+        let is_app_page = matches!(this.ty, AppEndpointType::Page { .. });
+
+        let module_graphs = this
+            .app_project
+            .app_module_graphs(
+                self,
+                *rsc_entry,
+                // We only need the client runtime entries for pages not for Route Handlers
+                is_app_page.then(|| this.app_project.client_runtime_entries()),
+            )
+            .await?;
+
+        let app_entry_chunks = self
+            .app_entry_chunks(
+                *client_references,
+                *server_action_manifest_loader,
+                server_path.clone(),
+                process_client_assets,
+                *module_graphs.full,
+            )
+            .to_resolved()
+            .await?;
+        let app_entry_chunk_group_ref = app_entry_chunks.await?;
+        let app_entry_chunks = app_entry_chunk_group_ref.assets;
+        let app_entry_chunks_ref = app_entry_chunks.await?;
+        let rsc_chunk = *app_entry_chunks_ref.first().unwrap();
+
+        Ok(trace_endpoint(
+            this.app_project.project(),
+            Some(app_function_name(&app_entry.original_name).into()),
+            *rsc_chunk,
+            client_reference_manifest
+                .iter()
+                .copied()
+                .chain(loadable_manifest_output.iter().flat_map(|m| &**m).copied())
+                .map(|m| *m)
+                .collect(),
+            *module_graphs.full,
+            vec![*rsc_entry],
+        ))
     }
 }
 
