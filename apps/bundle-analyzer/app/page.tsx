@@ -89,7 +89,7 @@ export default function Home() {
     size: number
     server?: boolean
     client?: boolean
-    traced: boolean
+    traced?: boolean
   } | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
 
