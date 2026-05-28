@@ -466,7 +466,11 @@ export class AnalyzeData {
       } else {
         server = true
       }
-      if (outputFile.filename.endsWith('.js')) {
+      if (
+        outputFile.filename.endsWith('.js') ||
+        outputFile.filename.endsWith('.mjs') ||
+        outputFile.filename.endsWith('.cjs')
+      ) {
         js = true
       } else if (outputFile.filename.endsWith('.css')) {
         css = true
